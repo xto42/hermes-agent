@@ -6,18 +6,70 @@ and resumed on next creation, preserving the filesystem across sessions.
 """
 
 import logging
-import time
 import math
+import os
 import shlex
 import threading
 import uuid
 import warnings
-from typing import Optional
+from pathlib import Path
+from typing import Dict, Optional
 
 from tools.environments.base import BaseEnvironment
-from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
+
+
+class _DaytonaProcessHandle:
+    """Adapter making Daytona's blocking SDK exec look like Popen."""
+
+    def __init__(self, sandbox, cmd_string, cwd, timeout):
+        self._done = threading.Event()
+        self._returncode = None
+        self._read_fd, self._write_fd = os.pipe()
+        self.stdout = os.fdopen(self._read_fd, "r")
+        self.stdin = None
+
+        # Wrap with shell timeout (Daytona SDK timeout is unreliable)
+        timed_cmd = f"timeout {timeout} bash -c {shlex.quote(cmd_string)}"
+
+        def _run():
+            try:
+                response = sandbox.process.exec(timed_cmd, cwd=cwd)
+                writer = os.fdopen(self._write_fd, "w")
+                writer.write(response.result or "")
+                writer.close()
+                self._returncode = response.exit_code
+            except Exception as e:
+                try:
+                    writer = os.fdopen(self._write_fd, "w")
+                    writer.write(f"Daytona execution error: {e}")
+                    writer.close()
+                except Exception:
+                    try:
+                        os.close(self._write_fd)
+                    except Exception:
+                        pass
+                self._returncode = 1
+            finally:
+                self._done.set()
+
+        self._thread = threading.Thread(target=_run, daemon=True)
+        self._thread.start()
+
+    def poll(self):
+        return self._returncode if self._done.is_set() else None
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        self._done.wait(timeout=timeout)
+        return self._returncode
+
+    @property
+    def returncode(self):
+        return self._returncode
 
 
 class DaytonaEnvironment(BaseEnvironment):
@@ -132,6 +184,13 @@ class DaytonaEnvironment(BaseEnvironment):
         # Upload credential files and skills directory into the sandbox.
         self._sync_skills_and_credentials()
 
+        # Capture login-shell environment into a snapshot for the unified model
+        self.init_session()
+
+    # ------------------------------------------------------------------
+    # File sync
+    # ------------------------------------------------------------------
+
     def _upload_if_changed(self, host_path: str, remote_path: str) -> bool:
         """Upload a file if its mtime/size changed since last sync."""
         hp = Path(host_path)
@@ -176,111 +235,35 @@ class DaytonaEnvironment(BaseEnvironment):
             self._sandbox.start()
             logger.info("Daytona: restarted sandbox %s", self._sandbox.id)
 
-    def _exec_in_thread(self, exec_command: str, cwd: Optional[str], timeout: int) -> dict:
-        """Run exec in a background thread with interrupt polling.
+    # ------------------------------------------------------------------
+    # Unified execution hooks
+    # ------------------------------------------------------------------
 
-        The Daytona SDK's exec(timeout=...) parameter is unreliable (the
-        server-side timeout is not enforced and the SDK has no client-side
-        fallback), so we wrap the command with the shell ``timeout`` utility
-        which reliably kills the process and returns exit code 124.
-        """
-        # Wrap with shell `timeout` to enforce the deadline reliably.
-        # Add a small buffer so the shell timeout fires before any SDK-level
-        # timeout would, giving us a clean exit code 124.
-        timed_command = f"timeout {timeout} sh -c {shlex.quote(exec_command)}"
-
-        result_holder: dict = {"value": None, "error": None}
-
-        def _run():
-            try:
-                response = self._sandbox.process.exec(
-                    timed_command, cwd=cwd,
-                )
-                result_holder["value"] = {
-                    "output": response.result or "",
-                    "returncode": response.exit_code,
-                }
-            except Exception as e:
-                result_holder["error"] = e
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        # Wait for timeout + generous buffer for network/SDK overhead
-        deadline = time.monotonic() + timeout + 10
-        while t.is_alive():
-            t.join(timeout=0.2)
-            if is_interrupted():
-                with self._lock:
-                    try:
-                        self._sandbox.stop()
-                    except Exception:
-                        pass
-                return {
-                    "output": "[Command interrupted - Daytona sandbox stopped]",
-                    "returncode": 130,
-                }
-            if time.monotonic() > deadline:
-                # Shell timeout didn't fire and SDK is hung — force stop
-                with self._lock:
-                    try:
-                        self._sandbox.stop()
-                    except Exception:
-                        pass
-                return self._timeout_result(timeout)
-
-        if result_holder["error"]:
-            return {"error": result_holder["error"]}
-        return result_holder["value"]
-
-    def execute(self, command: str, cwd: str = "", *,
-                timeout: Optional[int] = None,
-                stdin_data: Optional[str] = None) -> dict:
+    def _before_execute(self) -> None:
+        """Ensure sandbox is ready and sync credentials before each command."""
         with self._lock:
             self._ensure_sandbox_ready()
-        # Incremental sync before each command so mid-session credential
-        # refreshes and skill updates are picked up.
         self._sync_skills_and_credentials()
 
+    def _run_bash(self, cmd_string: str, *, stdin_data: str | None = None):
+        """Spawn ``bash -c <cmd_string>`` inside the Daytona sandbox.
+
+        Returns a _DaytonaProcessHandle (satisfies the ProcessHandle protocol).
+        stdin_data is embedded as a heredoc since Daytona cannot pipe stdin.
+        """
         if stdin_data is not None:
             marker = f"HERMES_EOF_{uuid.uuid4().hex[:8]}"
             while marker in stdin_data:
                 marker = f"HERMES_EOF_{uuid.uuid4().hex[:8]}"
-            command = f"{command} << '{marker}'\n{stdin_data}\n{marker}"
+            cmd_string = f"{cmd_string} << '{marker}'\n{stdin_data}\n{marker}"
+        effective_cwd = self.cwd or None
+        return _DaytonaProcessHandle(
+            self._sandbox, cmd_string, effective_cwd, self.timeout,
+        )
 
-        exec_command, sudo_stdin = self._prepare_command(command)
-
-        # Daytona sandboxes execute commands via the Daytona SDK and cannot
-        # pipe subprocess stdin directly the way a local Popen can.  When a
-        # sudo password is present, use a shell-level pipe from printf so that
-        # the password feeds sudo -S without appearing as an echo argument
-        # embedded in the shell string.  The password is still visible in the
-        # remote sandbox's command line, but it is not exposed on the user's
-        # local machine — which is the primary threat being mitigated.
-        if sudo_stdin is not None:
-            import shlex
-            exec_command = (
-                f"printf '%s\\n' {shlex.quote(sudo_stdin.rstrip())} | {exec_command}"
-            )
-        effective_cwd = cwd or self.cwd or None
-        effective_timeout = timeout or self.timeout
-
-        result = self._exec_in_thread(exec_command, effective_cwd, effective_timeout)
-
-        if "error" in result:
-            from daytona import DaytonaError
-            err = result["error"]
-            if isinstance(err, DaytonaError):
-                with self._lock:
-                    try:
-                        self._ensure_sandbox_ready()
-                    except Exception:
-                        return {"output": f"Daytona execution error: {err}", "returncode": 1}
-                result = self._exec_in_thread(exec_command, effective_cwd, effective_timeout)
-                if "error" not in result:
-                    return result
-            return {"output": f"Daytona execution error: {err}", "returncode": 1}
-
-        return result
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def cleanup(self):
         with self._lock:
