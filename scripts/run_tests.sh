@@ -41,10 +41,20 @@ fi
 
 PYTHON="$VENV/bin/python"
 
-# ── Ensure pytest-split is installed (required for shard-equivalent runs) ──
+# ── Verify pytest-split is installed (required for shard-equivalent runs) ──
+# This runner is a verification path, not a bootstrap path. It must not mutate
+# the runtime venv while trying to prove the checkout is healthy.
 if ! "$PYTHON" -c "import pytest_split" 2>/dev/null; then
-  echo "→ installing pytest-split into $VENV"
-  "$PYTHON" -m pip install --quiet "pytest-split>=0.9,<1"
+  cat >&2 <<EOF
+error: pytest-split is not installed in $VENV
+
+scripts/run_tests.sh does not install missing dependencies into the runtime venv.
+Install test dependencies via the project bootstrap/setup path, then rerun:
+
+  uv pip install --python "$PYTHON" 'pytest-split>=0.9,<1'
+
+EOF
+  exit 1
 fi
 
 # ── Hermetic environment ────────────────────────────────────────────────────
